@@ -1,0 +1,198 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <EEPROM.h>
+#include <ESP32Servo.h>
+
+#define RST_PIN          4
+#define SS_PIN           5
+#define BUTTON_PIN       14
+#define SERVO_LOGIN_PIN  13
+#define SERVO_REGIS_PIN  12
+#define TRIG_PIN         2
+#define ECHO_PIN         15
+
+#define EEPROM_SIZE     512
+#define MAX_CARDS       20
+#define UID_LENGTH      4
+
+MFRC522 rfid(SS_PIN, RST_PIN);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+Servo servoLogin;
+Servo servoRegis;
+
+bool isRegisMode = false;
+String currentMode = "login";
+
+unsigned long lastDebounceTime = 0;
+bool lastButtonState = HIGH;
+
+void setup() {
+  Serial.begin(115200);
+  SPI.begin();
+  rfid.PCD_Init();
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  lcd.init();
+  lcd.backlight();
+
+  EEPROM.begin(EEPROM_SIZE);
+
+  servoLogin.attach(SERVO_LOGIN_PIN);
+  servoLogin.write(0);
+
+  servoRegis.attach(SERVO_REGIS_PIN);
+  servoRegis.write(0);
+
+  printLCD("Mode: Login", "Tap kartu");
+}
+
+void loop() {
+  if (currentMode == "menu") {
+    // MODE MENU UTAMA: tampilkan jarak dan cek tombol
+    long durasi, jarak;
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+
+    durasi = pulseIn(ECHO_PIN, HIGH);
+    jarak = durasi * 0.034 / 2;
+
+    lcd.setCursor(0, 0);
+    lcd.print("Jarak: ");
+    lcd.print(jarak);
+    lcd.print(" cm    ");
+
+    // Cek tombol ditekan untuk kembali ke login
+    if (digitalRead(BUTTON_PIN) == LOW && (millis() - lastDebounceTime) > 300) {
+      lastDebounceTime = millis();
+      currentMode = "login";
+      printLCD("Mode: Login", "Tap kartu");
+      delay(500);
+    }
+
+    delay(500);
+    return;
+  }
+
+  handleButton();
+
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+    String uid = getCardUID();
+    Serial.println("UID: " + uid);
+
+    if (isRegisMode) {
+      if (isUIDRegistered(uid)) {
+        printLCD("Kartu sudah", "terdaftar!");
+        bukaServoRegis();
+      } else {
+        registerUID(uid);
+        String regCode = "RC" + uid;
+        printLCD("RegCode:", regCode);
+        Serial.println("Registration Code: " + regCode);
+      }
+    } else {
+      if (isUIDRegistered(uid)) {
+        printLCD("Login", "berhasil");
+        bukaServoLogin();
+
+        // MASUK KE MODE MENU UTAMA
+        currentMode = "menu";
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Masuk ke menu");
+        lcd.setCursor(0, 1);
+        lcd.print("utama...");
+        delay(2000);
+        lcd.clear();
+      } else {
+        printLCD("Silahkan", "login");
+      }
+    }
+
+    delay(2000);
+    printLCD(isRegisMode ? "Mode: Regis" : "Mode: Login", "Tap kartu");
+
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+  }
+}
+
+void handleButton() {
+  bool reading = digitalRead(BUTTON_PIN);
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+    lastButtonState = reading;
+  }
+
+  if ((millis() - lastDebounceTime) > 50 && reading == LOW) {
+    isRegisMode = !isRegisMode;
+    printLCD(isRegisMode ? "Mode: Regis" : "Mode: Login", "Tap kartu");
+    delay(500);
+  }
+}
+
+String getCardUID() {
+  String uid = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    uid += String(rfid.uid.uidByte[i], HEX);
+  }
+  uid.toUpperCase();
+  return uid;
+}
+
+bool isUIDRegistered(String uid) {
+  for (int i = 0; i < MAX_CARDS; i++) {
+    String storedUID = "";
+    for (int j = 0; j < UID_LENGTH; j++) {
+      byte val = EEPROM.read(i * UID_LENGTH + j);
+      if (val != 0xFF) {
+        storedUID += String(val, HEX);
+      }
+    }
+    storedUID.toUpperCase();
+    if (storedUID == uid) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void registerUID(String uid) {
+  for (int i = 0; i < MAX_CARDS; i++) {
+    if (EEPROM.read(i * UID_LENGTH) == 0xFF) {
+      for (int j = 0; j < UID_LENGTH; j++) {
+        EEPROM.write(i * UID_LENGTH + j, rfid.uid.uidByte[j]);
+      }
+      EEPROM.commit();
+      return;
+    }
+  }
+  Serial.println("EEPROM penuh!");
+}
+
+void printLCD(String line1, String line2) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+  lcd.setCursor(0, 1);
+  lcd.print(line2);
+}
+
+void bukaServoLogin() {
+  servoLogin.write(90);
+  delay(3000);
+  servoLogin.write(0);
+}
+
+void bukaServoRegis() {
+  servoRegis.write(90);
+  delay(3000);
+  servoRegis.write(0);
+}
