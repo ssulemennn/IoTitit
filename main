@@ -1,0 +1,392 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ArduinoJson.h>
+
+// WiFi credentials
+const char* ssid = "KDM";
+const char* password = "jekjek432";
+
+// Server configuration
+const char* serverHost = "192.168.4.115";  // Replace with your server's IP
+const int serverPort = 5000;
+
+// RFID pins
+#define RST_PIN         4
+#define SS_PIN          5
+#define SDA_PIN         21
+#define SCL_PIN         22
+#define BUTTON_PIN      14
+
+// Initialize components
+MFRC522 rfid(SS_PIN, RST_PIN);
+LiquidCrystal_I2C lcd(0x27, 16, 2);  // I2C address 0x27, 16 columns and 2 rows
+
+// Variables
+String lastCardNumber = "";
+unsigned long lastReadTime = 0;
+const unsigned long READ_INTERVAL = 2000; // 2 seconds between reads
+bool wifiConnected = false;
+unsigned long lastReconnectAttempt = 0;
+const unsigned long RECONNECT_INTERVAL = 5000; // Try to reconnect every 5 seconds
+unsigned long lastPingTime = 0;
+const unsigned long PING_INTERVAL = 25000; // Send ping every 25 seconds
+String currentRegistrationCode = "";
+unsigned long registrationCodeTimestamp = 0;
+const unsigned long REGISTRATION_CODE_TIMEOUT = 180000; // 3 minutes in milliseconds
+String lastRegistrationCode = "";
+unsigned long lastRegistrationCodeTimestamp = 0;
+bool isLoggedIn = false;
+String currentUsername = "";
+int currentPoints = 0;
+bool lastButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50;
+unsigned long regCodeDisplayStart = 0;
+const unsigned long REG_CODE_DISPLAY_DURATION = 180000; // 3 minutes in ms
+bool regCodeActive = false;
+bool lastButtonStateReg = HIGH;
+unsigned long lastDebounceTimeReg = 0;
+const unsigned long debounceDelayReg = 50;
+
+// Display states
+enum DisplayState {
+  WAITING,
+  CARD_DETECTED,
+  SHOW_USER,
+  SHOW_REG_CODE,
+  ERROR_STATE
+};
+
+DisplayState currentState = WAITING;
+DisplayState lastState = ERROR_STATE; // Force update on first run
+
+String displayCardNumber = "";
+String displayUsername = "";
+int displayPoints = 0;
+String displayRegCode = "";
+String errorMsg = "";
+
+void updateLCD() {
+  if (currentState != lastState || (currentState == SHOW_REG_CODE && regCodeActive)) {
+    lcd.clear();
+    switch (currentState) {
+      case WAITING:
+        lcd.setCursor(0, 0);
+        lcd.print("Waiting for RFID");
+        lcd.setCursor(0, 1);
+        lcd.print("card...");
+        break;
+      case CARD_DETECTED:
+        lcd.setCursor(0, 0);
+        lcd.print("Card detected:");
+        lcd.setCursor(0, 1);
+        lcd.print(displayCardNumber);
+        break;
+      case SHOW_USER:
+        lcd.setCursor(0, 0);
+        lcd.print("Hello, " + displayUsername);
+        lcd.setCursor(0, 1);
+        lcd.print("Points: " + String(displayPoints));
+        break;
+      case SHOW_REG_CODE: {
+        lcd.setCursor(0, 0);
+        lcd.print("Reg Code: " + displayRegCode);
+        unsigned long elapsed = millis() - regCodeDisplayStart;
+        unsigned long remaining = (elapsed < REG_CODE_DISPLAY_DURATION) ? (REG_CODE_DISPLAY_DURATION - elapsed) : 0;
+        int seconds = (remaining / 1000) % 60;
+        int minutes = (remaining / 60000);
+        lcd.setCursor(0, 1);
+        lcd.print("Valid for: ");
+        if (minutes < 10) lcd.print("0");
+        lcd.print(minutes);
+        lcd.print(":");
+        if (seconds < 10) lcd.print("0");
+        lcd.print(seconds);
+        break;
+      }
+      case ERROR_STATE:
+        lcd.setCursor(0, 0);
+        lcd.print("Error:");
+        lcd.setCursor(0, 1);
+        lcd.print(errorMsg);
+        break;
+    }
+    lastState = currentState;
+
+    // Debug output
+    Serial.print("LCD State: ");
+    Serial.println(currentState);
+    Serial.print("Card: "); Serial.println(displayCardNumber);
+    Serial.print("User: "); Serial.println(displayUsername);
+    Serial.print("Points: "); Serial.println(displayPoints);
+    Serial.print("RegCode: "); Serial.println(displayRegCode);
+    Serial.print("Error: "); Serial.println(errorMsg);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize I2C
+  Wire.begin(SDA_PIN, SCL_PIN);
+  
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Initializing...");
+  
+  // Initialize SPI bus
+  SPI.begin();
+  
+  // Initialize RFID reader
+  rfid.PCD_Init();
+  
+  // Initialize button pin
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  
+  // Connect to WiFi
+  connectToWiFi();
+  
+  currentState = WAITING;
+  updateLCD();
+}
+
+void loop() {
+  // Check WiFi connection
+  if (WiFi.status() != WL_CONNECTED) {
+    if (wifiConnected) {
+      errorMsg = "WiFi lost. Reconn";
+      errorMsg += "ecting...";
+      currentState = ERROR_STATE;
+      updateLCD();
+      wifiConnected = false;
+    }
+    connectToWiFi();
+  } else if (!wifiConnected) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Connected!");
+    lcd.setCursor(0, 1);
+    lcd.print(WiFi.localIP());
+    delay(2000);
+    // Show waiting message
+    currentState = WAITING;
+    updateLCD();
+    wifiConnected = true;
+  }
+
+  // Always show waiting message after WiFi connects
+  if (WiFi.status() == WL_CONNECTED && currentState == WAITING) {
+    updateLCD();
+  }
+
+  // Handle reg code display timer and button
+  if (currentState == SHOW_REG_CODE && regCodeActive) {
+    unsigned long elapsed = millis() - regCodeDisplayStart;
+    if (elapsed >= REG_CODE_DISPLAY_DURATION) {
+      // Reg code expired
+      regCodeActive = false;
+      displayRegCode = "";
+      currentRegistrationCode = "";
+      lastCardNumber = ""; // Allow re-tap of same card
+      errorMsg = "Reg code expired";
+      currentState = ERROR_STATE;
+      updateLCD();
+      Serial.println("Reg code expired, returning to idle");
+      delay(2000);
+      currentState = WAITING;
+      updateLCD();
+    } else {
+      // Update timer every second
+      static unsigned long lastSecondUpdate = 0;
+      if (millis() - lastSecondUpdate >= 1000) {
+        updateLCD();
+        lastSecondUpdate = millis();
+      }
+      // Handle button to cancel reg code
+      bool reading = digitalRead(BUTTON_PIN);
+      if (reading != lastButtonStateReg) {
+        lastDebounceTimeReg = millis();
+      }
+      if ((millis() - lastDebounceTimeReg) > debounceDelayReg) {
+        if (reading == LOW) { // Button pressed
+          regCodeActive = false;
+          displayRegCode = "";
+          currentRegistrationCode = "";
+          lastCardNumber = ""; // Allow re-tap of same card
+          currentState = WAITING;
+          updateLCD();
+          Serial.println("Reg code cancelled by button, returning to idle");
+        }
+      }
+      lastButtonStateReg = reading;
+    }
+    return; // Don't process other states while reg code is active
+  }
+
+  // Check registration code timeout
+  if (currentRegistrationCode != "" && (millis() - registrationCodeTimestamp > REGISTRATION_CODE_TIMEOUT)) {
+    currentRegistrationCode = "";
+    errorMsg = "Reg code expired";
+    currentState = ERROR_STATE;
+    updateLCD();
+    delay(2000);
+    currentState = WAITING;
+    updateLCD();
+  }
+
+  // Handle logout button
+  if (isLoggedIn && currentState == SHOW_USER) {
+    handleLogoutButton();
+  }
+
+  // Read RFID card if not logged in
+  if (!isLoggedIn && currentState == WAITING && rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+    // Get card number
+    String cardNumber = "";
+    for (byte i = 0; i < rfid.uid.size; i++) {
+      cardNumber += String(rfid.uid.uidByte[i], HEX);
+    }
+    cardNumber.toUpperCase();
+    
+    // Check if it's a new card and enough time has passed
+    if (cardNumber != lastCardNumber && (millis() - lastReadTime > READ_INTERVAL)) {
+      lastCardNumber = cardNumber;
+      lastReadTime = millis();
+      
+      displayCardNumber = cardNumber;
+      currentState = CARD_DETECTED;
+      updateLCD();
+      
+      // Send RFID number to server
+      sendRFIDToServer(cardNumber);
+    }
+    
+    // Halt PICC
+    rfid.PICC_HaltA();
+    // Stop encryption on PCD
+    rfid.PCD_StopCrypto1();
+  }
+  updateLCD();
+}
+
+void connectToWiFi() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting to");
+  lcd.setCursor(0, 1);
+  lcd.print("WiFi...");
+  
+  WiFi.begin(ssid, password);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("WiFi Connected!");
+  lcd.setCursor(0, 1);
+  lcd.print(WiFi.localIP());
+  
+  delay(2000);
+  
+  // Display waiting message after WiFi connection
+  currentState = WAITING;
+  updateLCD();
+}
+
+void handleLogoutButton() {
+  bool reading = digitalRead(BUTTON_PIN);
+  
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+  
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    if (reading == LOW) {  // Button is pressed (LOW because of INPUT_PULLUP)
+      logout();
+    }
+  }
+  
+  lastButtonState = reading;
+}
+
+void logout() {
+  isLoggedIn = false;
+  currentUsername = "";
+  currentPoints = 0;
+  displayUsername = "";
+  displayPoints = 0;
+  currentState = WAITING;
+  updateLCD();
+}
+
+void sendRFIDToServer(String cardNumber) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String serverUrl = "http://" + String(serverHost) + ":" + String(serverPort) + "/api/rfid/register_request";
+    http.begin(serverUrl);
+    http.addHeader("Content-Type", "application/json");
+    String payload = "{\"rfid_number\":\"" + cardNumber + "\"}";
+    
+    Serial.println("Sending RFID to server: " + cardNumber);
+    int httpResponseCode = http.POST(payload);
+    String response = http.getString();
+    
+    Serial.println("Server response code: " + String(httpResponseCode));
+    Serial.println("Server response: " + response);
+    
+    if (httpResponseCode == 200) {
+      // Use ArduinoJson to parse the response
+      StaticJsonDocument<256> doc;
+      DeserializationError error = deserializeJson(doc, response);
+
+      if (!error) {
+        bool valid = doc["valid"] | false;
+        if (valid) {
+          // Existing user
+          displayUsername = doc["username"] | "";
+          displayPoints = doc["points"] | 0;
+          currentState = SHOW_USER;
+          updateLCD();
+          isLoggedIn = true;
+          Serial.println("User logged in: " + displayUsername + " with " + String(displayPoints) + " points");
+        } else if (doc.containsKey("registration_code")) {
+          // New user
+          displayRegCode = doc["registration_code"].as<String>();
+          regCodeDisplayStart = millis();
+          regCodeActive = true;
+          currentState = SHOW_REG_CODE;
+          updateLCD();
+          lastRegistrationCode = displayRegCode;
+          lastRegistrationCodeTimestamp = millis();
+          Serial.println("New registration code: " + displayRegCode);
+        }
+      } else {
+        errorMsg = "JSON parse error";
+        currentState = ERROR_STATE;
+        updateLCD();
+        Serial.println("JSON parse error: " + String(error.c_str()));
+      }
+    } else {
+      errorMsg = "Server error:" + String(httpResponseCode);
+      currentState = ERROR_STATE;
+      updateLCD();
+      Serial.println("Server error: " + String(httpResponseCode));
+    }
+    http.end();
+  } else {
+    errorMsg = "WiFi not connected";
+    currentState = ERROR_STATE;
+    updateLCD();
+    Serial.println("WiFi not connected");
+  }
+}
